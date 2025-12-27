@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.battery.limiter</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/tarunkumarmahato/battery-charge-limiter/battery_limiter.py</string>
+        <string>80</string>
+        <string>60</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/tarunkumarmahato/battery-charge-limiter/stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/tarunkumarmahato/battery-charge-limiter/stderr.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/tarunkumarmahato/battery-charge-limiter</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/tarunkumarmahato/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
+</dict>
+</plist>
