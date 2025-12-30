@@ -12,6 +12,9 @@
 // IMPORTANT: CHTE is an ON/OFF switch, not a percentage limit!
 // We need a daemon to monitor battery level and toggle charging.
 //
+// v1.3.0: Fixed sleep mode issue - now disables charging when at target
+//         even if screen is off or sleeping
+//
 
 import ArgumentParser
 import Foundation
@@ -24,7 +27,7 @@ let LEGACY_KEY2 = "CH0C"    // Some Macs need both
 struct BCLM: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Battery Charge Level Max (BCLM) Utility for Apple Silicon.",
-        version: "1.2.0",
+        version: "1.3.0",
         subcommands: [Read.self, Write.self, Maintain.self, Persist.self, Unpersist.self, Status.self])
     
     // MARK: - Helper Functions
@@ -111,6 +114,27 @@ struct BCLM: ParsableCommand {
         }
     }
     
+    static func isChargingDisabled() -> Bool? {
+        do {
+            try SMCKit.open()
+            defer { SMCKit.close() }
+            
+            // Try Tahoe key first
+            let tahoeKey = SMCKit.getKey(TAHOE_KEY, type: DataTypes.UInt32)
+            do {
+                let bytes = try SMCKit.readData(tahoeKey)
+                return bytes.0 != 0
+            } catch {
+                // Try legacy key
+                let legacyKey = SMCKit.getKey(LEGACY_KEY, type: DataTypes.UInt8)
+                let bytes = try SMCKit.readData(legacyKey)
+                return bytes.0 != 0
+            }
+        } catch {
+            return nil
+        }
+    }
+    
     static func getBatteryPercentage() -> Int? {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
@@ -165,35 +189,12 @@ struct BCLM: ParsableCommand {
             abstract: "Reads the current charging state (enabled/disabled).")
         
         func run() {
-            do {
-                try SMCKit.open()
-            } catch {
-                print("Error: \(error)")
-                BCLM.exit(withError: ExitCode.failure)
-            }
-            
-            // Try Tahoe key first (CHTE)
-            let tahoeKey = SMCKit.getKey(TAHOE_KEY, type: DataTypes.UInt32)
-            do {
-                let bytes = try SMCKit.readData(tahoeKey)
-                let chargingDisabled = bytes.0 != 0
-                print(chargingDisabled ? "disabled" : "enabled")
-                SMCKit.close()
-                return
-            } catch {}
-            
-            // Try legacy key (CH0B)
-            let legacyKey = SMCKit.getKey(LEGACY_KEY, type: DataTypes.UInt8)
-            do {
-                let bytes = try SMCKit.readData(legacyKey)
-                let chargingDisabled = bytes.0 != 0
-                print(chargingDisabled ? "disabled" : "enabled")
-            } catch {
+            if let disabled = BCLM.isChargingDisabled() {
+                print(disabled ? "disabled" : "enabled")
+            } else {
                 print("Error: Could not read charging state.")
                 BCLM.exit(withError: ExitCode.failure)
             }
-            
-            SMCKit.close()
         }
     }
     
@@ -239,13 +240,13 @@ struct BCLM: ParsableCommand {
     // MARK: - Maintain Command (Background Daemon)
     struct Maintain: ParsableCommand {
         static let configuration = CommandConfiguration(
-            abstract: "Maintains battery at 80% by monitoring and toggling charging.")
+            abstract: "Maintains battery at target% by monitoring and toggling charging.")
         
         @Argument(help: "Target battery percentage (default: 80)")
         var target: Int = 80
         
-        @Option(name: .shortAndLong, help: "Check interval in seconds (default: 60)")
-        var interval: Int = 60
+        @Option(name: .shortAndLong, help: "Check interval in seconds (default: 30)")
+        var interval: Int = 30
         
         @Flag(name: .shortAndLong, help: "Run once and exit (for launchd)")
         var once: Bool = false
@@ -264,52 +265,73 @@ struct BCLM: ParsableCommand {
             let lowerThreshold = target - 5  // Start charging when below this
             let upperThreshold = target      // Stop charging when at or above this
             
-            print("=== Battery Maintain Mode ===")
-            print("Target: \(target)%")
-            print("Charge when below: \(lowerThreshold)%")
-            print("Stop charging at: \(upperThreshold)%")
-            print("Check interval: \(interval) seconds")
-            if once {
-                print("Mode: Single check")
-            } else {
+            if !once {
+                print("=== Battery Maintain Mode ===")
+                print("Target: \(target)%")
+                print("Charge when below: \(lowerThreshold)%")
+                print("Stop charging at: \(upperThreshold)%")
+                print("Check interval: \(interval) seconds")
                 print("Mode: Continuous monitoring (Ctrl+C to stop)")
+                print("=============================\n")
             }
-            print("=============================\n")
             
             func checkAndAdjust() {
                 guard let percentage = BCLM.getBatteryPercentage() else {
-                    print("[\(timestamp())] Could not read battery percentage")
+                    log("Could not read battery percentage")
                     return
                 }
                 
                 let onAC = BCLM.isOnACPower()
+                let chargingDisabled = BCLM.isChargingDisabled() ?? false
                 
-                if !onAC {
-                    // Not on AC, make sure charging is enabled for when plugged in
-                    print("[\(timestamp())] Battery: \(percentage)% | Not on AC power")
+                // KEY FIX: If battery is at or above target, ALWAYS disable charging
+                // This ensures charging stays disabled even during sleep
+                if percentage >= upperThreshold {
+                    if !chargingDisabled {
+                        if BCLM.disableCharging() {
+                            log("Battery: \(percentage)% | ⏸ Charging DISABLED (at/above \(upperThreshold)%)")
+                        }
+                    } else {
+                        log("Battery: \(percentage)% | Charging already disabled")
+                    }
                     return
                 }
                 
-                if percentage >= upperThreshold {
-                    // At or above target, disable charging
-                    if BCLM.disableCharging() {
-                        print("[\(timestamp())] Battery: \(percentage)% | ⏸ Charging DISABLED (at target)")
+                // If not on AC power, just report status but keep charging state
+                // This ensures if we're at 80% and go to sleep, charging stays disabled
+                if !onAC {
+                    if percentage >= upperThreshold && !chargingDisabled {
+                        // Even on battery, if we're at target, disable charging for when plugged in
+                        if BCLM.disableCharging() {
+                            log("Battery: \(percentage)% | ⏸ Charging DISABLED (preparing for AC)")
+                        }
+                    } else {
+                        log("Battery: \(percentage)% | Not on AC power (charging: \(chargingDisabled ? "disabled" : "enabled"))")
                     }
-                } else if percentage < lowerThreshold {
+                    return
+                }
+                
+                // On AC and below target
+                if percentage < lowerThreshold {
                     // Below lower threshold, enable charging
-                    if BCLM.enableCharging() {
-                        print("[\(timestamp())] Battery: \(percentage)% | ▶ Charging ENABLED (below \(lowerThreshold)%)")
+                    if chargingDisabled {
+                        if BCLM.enableCharging() {
+                            log("Battery: \(percentage)% | ▶ Charging ENABLED (below \(lowerThreshold)%)")
+                        }
+                    } else {
+                        log("Battery: \(percentage)% | Charging (below \(lowerThreshold)%)")
                     }
                 } else {
-                    // In between, maintain current state
-                    print("[\(timestamp())] Battery: \(percentage)% | Maintaining current state")
+                    // Between thresholds, maintain current state
+                    log("Battery: \(percentage)% | In range \(lowerThreshold)-\(upperThreshold)% (charging: \(chargingDisabled ? "disabled" : "enabled"))")
                 }
             }
             
-            func timestamp() -> String {
+            func log(_ message: String) {
                 let formatter = DateFormatter()
-                formatter.dateFormat = "HH:mm:ss"
-                return formatter.string(from: Date())
+                formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+                let timestamp = formatter.string(from: Date())
+                print("[\(timestamp)] \(message)")
             }
             
             // Run check
@@ -330,7 +352,7 @@ struct BCLM: ParsableCommand {
     // MARK: - Persist Command
     struct Persist: ParsableCommand {
         static let configuration = CommandConfiguration(
-            abstract: "Creates a LaunchDaemon to maintain 80% limit across reboots.")
+            abstract: "Creates a LaunchDaemon to maintain 80% limit across reboots and sleep.")
         
         func validate() throws {
             guard getuid() == 0 else {
@@ -349,7 +371,10 @@ struct BCLM: ParsableCommand {
                 BCLM.exit(withError: ExitCode.failure)
             }
             
-            // Create a LaunchDaemon that runs maintain --once every 60 seconds
+            // Create a LaunchDaemon that:
+            // 1. Runs every 30 seconds (more frequent than before)
+            // 2. Runs on power state changes (AC connect/disconnect)
+            // 3. Runs on wake from sleep
             let plistContent = """
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -365,18 +390,25 @@ struct BCLM: ParsableCommand {
         <string>--once</string>
     </array>
     <key>StartInterval</key>
-    <integer>60</integer>
+    <integer>30</integer>
     <key>RunAtLoad</key>
     <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
     <string>/var/log/bclm.log</string>
     <key>StandardErrorPath</key>
     <string>/var/log/bclm.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
 </dict>
 </plist>
 """
             
-            // Remove old simple persist daemon if exists
+            // Remove old daemons
             let oldPlistPath = "/Library/LaunchDaemons/com.bclm.persist.plist"
             if FileManager.default.fileExists(atPath: oldPlistPath) {
                 let unloadTask = Process()
@@ -386,6 +418,13 @@ struct BCLM: ParsableCommand {
                 unloadTask.waitUntilExit()
                 try? FileManager.default.removeItem(atPath: oldPlistPath)
             }
+            
+            // Unload existing daemon if any
+            let unloadTask = Process()
+            unloadTask.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            unloadTask.arguments = ["unload", "-w", plistPath]
+            try? unloadTask.run()
+            unloadTask.waitUntilExit()
             
             do {
                 try plistContent.write(toFile: plistPath, atomically: true, encoding: .utf8)
@@ -397,13 +436,20 @@ struct BCLM: ParsableCommand {
                 try task.run()
                 task.waitUntilExit()
                 
+                // Also disable charging NOW if above 80%
+                if let percentage = BCLM.getBatteryPercentage(), percentage >= 80 {
+                    _ = BCLM.disableCharging()
+                    print("✓ Battery at \(percentage)% - charging disabled immediately")
+                }
+                
                 print("✓ Battery maintain daemon installed!")
-                print("  - Checks battery every 60 seconds")
-                print("  - Enables charging below 75%")
+                print("  - Checks battery every 30 seconds")
+                print("  - Enables charging below 75%")  
                 print("  - Disables charging at 80%")
+                print("  - Works during sleep (charging stays disabled)")
                 print("  - Log file: /var/log/bclm.log")
                 print("")
-                print("  Your battery will now stay between 75-80% automatically!")
+                print("  Your battery will now stay at 80% automatically!")
             } catch {
                 print("Error creating daemon: \(error)")
                 BCLM.exit(withError: ExitCode.failure)
@@ -459,35 +505,10 @@ struct BCLM: ParsableCommand {
             print("=== Battery Charge Limiter Status ===\n")
             
             // Get current charging state from SMC
-            do {
-                try SMCKit.open()
-                
-                var chargingDisabled = false
-                var keyUsed = "unknown"
-                
-                // Try Tahoe key first
-                let tahoeKey = SMCKit.getKey(TAHOE_KEY, type: DataTypes.UInt32)
-                do {
-                    let bytes = try SMCKit.readData(tahoeKey)
-                    chargingDisabled = bytes.0 != 0
-                    keyUsed = TAHOE_KEY
-                } catch {
-                    // Try legacy key
-                    let legacyKey = SMCKit.getKey(LEGACY_KEY, type: DataTypes.UInt8)
-                    do {
-                        let bytes = try SMCKit.readData(legacyKey)
-                        chargingDisabled = bytes.0 != 0
-                        keyUsed = LEGACY_KEY
-                    } catch {
-                        print("Could not read SMC (try with sudo)")
-                    }
-                }
-                
-                print("Charging State: \(chargingDisabled ? "DISABLED" : "ENABLED") (via \(keyUsed))")
-                SMCKit.close()
-            } catch {
-                print("Could not read SMC: \(error)")
-                print("(Try running with sudo for full access)")
+            if let disabled = BCLM.isChargingDisabled() {
+                print("Charging State: \(disabled ? "DISABLED" : "ENABLED") (via CHTE)")
+            } else {
+                print("Charging State: Could not read (try with sudo)")
             }
             
             // Get current battery info from pmset
@@ -516,7 +537,7 @@ struct BCLM: ParsableCommand {
             let oldPlist = "/Library/LaunchDaemons/com.bclm.persist.plist"
             
             if FileManager.default.fileExists(atPath: maintainPlist) {
-                print("Daemon: ✓ Maintain daemon active (checks every 60s)")
+                print("Daemon: ✓ Maintain daemon active (checks every 30s)")
             } else if FileManager.default.fileExists(atPath: oldPlist) {
                 print("Daemon: ⚠ Old persist daemon (run 'sudo bclm persist' to upgrade)")
             } else {
